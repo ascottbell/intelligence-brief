@@ -17,24 +17,140 @@ load_dotenv(dotenv_path=env_path)
 
 from .aggregator import Aggregator, BriefGenerator
 from .config import get_settings
-from .models import DailyBrief
+from .models import DailyBrief, DiscoveredSource, SourceType
+
+
+def log_brief_to_doris_memory(brief: DailyBrief):
+    """
+    Log key brief contents to Doris memory so she can reference them later.
+
+    Stores:
+    - Each story from "What's Moving" as a brief_topic
+    - Key recommendations from Doris's Take as brief_recommendation
+    """
+    try:
+        # Import Doris memory store
+        sys.path.insert(0, "/Users/macmini/Projects/doris")
+        from memory.store import store_memory
+
+        brief_date = brief.date
+        stored_count = 0
+
+        # Store each "What's Moving" story
+        for story in brief.whats_moving:
+            content = f"{story.headline}: {story.context}"
+            store_memory(
+                content=content,
+                category="brief_topic",
+                subject=brief_date,
+                source=f"intelligence_brief:{brief_date}",
+                confidence=0.9,
+                metadata={
+                    "url": str(story.source_url),  # Convert HttpUrl to string
+                    "source_name": story.source_name,
+                    "brief_date": brief_date,
+                }
+            )
+            stored_count += 1
+
+        # Store Doris's Take as recommendations
+        if brief.claudes_take:
+            store_memory(
+                content=f"Brief recommendations ({brief_date}): {brief.claudes_take}",
+                category="brief_recommendation",
+                subject=brief_date,
+                source=f"intelligence_brief:{brief_date}",
+                confidence=0.9,
+                metadata={"brief_date": brief_date}
+            )
+            stored_count += 1
+
+        # Store the quick catchup as a summary
+        if brief.quick_catchup:
+            store_memory(
+                content=f"Brief summary ({brief_date}): {brief.quick_catchup}",
+                category="brief_summary",
+                subject=brief_date,
+                source=f"intelligence_brief:{brief_date}",
+                confidence=0.9,
+                metadata={"brief_date": brief_date}
+            )
+            stored_count += 1
+
+        print(f"✓ Logged {stored_count} items to Doris memory")
+        return stored_count
+
+    except Exception as e:
+        print(f"⚠ Could not log to Doris memory: {e}")
+        return 0
 
 
 async def run_aggregation(publish: bool = False, notify: bool = False, email: bool = False):
     """Run the full aggregation and analysis pipeline."""
+    from .memory_integration import get_dynamic_topics, get_hours_since_last_brief
+    from .source_discovery import discover_sources_for_topics, get_all_discovered_sources
+
     settings = get_settings()
     aggregator = Aggregator()
     generator = BriefGenerator()
-    
+
     try:
         print(f"Starting aggregation at {datetime.now().isoformat()}")
-        
-        # Fetch and analyze
+
+        # Step 1: Get dynamic topics from Doris memory
+        print("Fetching dynamic topics from Doris memory...")
+        hours_back = get_hours_since_last_brief()
+        dynamic_topics = get_dynamic_topics(
+            anthropic_api_key=settings.anthropic_api_key,
+            hours_since_last_brief=hours_back,
+            model=settings.anthropic_model
+        )
+        print(f"  Found {len(dynamic_topics)} dynamic topics: {dynamic_topics[:5]}...")
+
+        # Step 2: Discover new sources for gap topics
+        print("Checking for source gaps and discovering new sources...")
+        newly_discovered = await discover_sources_for_topics(
+            dynamic_topics=dynamic_topics,
+            settings=settings,
+            max_new_sources=3
+        )
+        if newly_discovered:
+            print(f"  Discovered {len(newly_discovered)} new sources:")
+            for src in newly_discovered:
+                print(f"    - {src['name']} ({src['type']}) for topic '{src['topic']}'")
+
+        # Step 3: Fetch and analyze (aggregator now includes discovered sources)
         items, sources = await aggregator.aggregate_and_analyze()
-        
-        # Generate brief
+
+        # Step 4: Generate brief
         brief = await generator.generate_brief(items, sources)
-        
+
+        # Convert discovered sources to DiscoveredSource objects for the brief
+        if newly_discovered:
+            brief.new_voices = [
+                DiscoveredSource(
+                    source_type=SourceType.REDDIT if src.get('type') == 'reddit' else SourceType.RSS,
+                    handle=src.get('name', ''),
+                    display_name=src.get('name'),
+                    discovered_via=f"topic:{src.get('topic', 'unknown')}",
+                    relevance_score=src.get('quality_score', 0.5),
+                    sample_content=src.get('topics_covered', []),
+                    recommendation_reason=src.get('reason'),
+                    is_recommended=True,
+                )
+                for src in newly_discovered
+            ]
+
+        # Step 5: Store brief in searchable database
+        print("Storing brief in database...")
+        from .brief_storage import store_brief
+        brief_id = store_brief(brief)
+        print(f"  Stored brief with ID: {brief_id}")
+
+        # Step 6: Log brief contents to Doris memory for future reference
+        print("Logging brief to Doris memory...")
+        log_brief_to_doris_memory(brief)
+
         # Format for display
         text = generator.format_brief_text(brief)
         print(text)
@@ -64,87 +180,125 @@ def send_email_resend(
     resend_api_key: str | None = None,
 ):
     """Send brief notification via Resend with full brief content."""
+    import markdown
+
     if not resend_api_key:
         print("✗ Resend API key not configured, skipping email")
         return
-    
+
     resend.api_key = resend_api_key
-    
-    # Build Whats Moving section
-    whats_moving_html = ""
-    if brief.whats_moving:
-        stories_html = ""
-        for story in brief.whats_moving:
-            stories_html += f"""
-            <div style="margin-bottom: 20px;">
-                <p style="font-weight: 600; margin: 0 0 4px 0;">▸ {story.headline}</p>
-                <p style="margin: 0 0 4px 0; color: #44403c;">{story.context}</p>
-                <a href="{story.source_url}" style="font-size: 14px; color: #2563eb;">Read more →</a>
+
+    # Convert Doris's narrative (markdown with links) to HTML
+    narrative_html = ""
+    if brief.claudes_take:
+        # Convert markdown to HTML (handles [link](url) syntax)
+        narrative_html = markdown.markdown(brief.claudes_take)
+
+    # Build Research Radar section
+    research_html = ""
+    research_items = [brief.paper_of_the_day] if brief.paper_of_the_day else []
+    research_items.extend(brief.homelab_corner or [])
+    if research_items:
+        items_html = ""
+        for item in research_items[:4]:
+            items_html += f"""
+            <div style="margin-bottom: 12px;">
+                <a href="{item.url}" style="color: #2563eb; text-decoration: none; font-weight: 500;">{item.title}</a>
+                <p style="margin: 4px 0 0 0; font-size: 14px; color: #57534e;">{item.insight_summary or ''}</p>
             </div>
             """
-        whats_moving_html = f"""
-        <div style="margin-bottom: 32px;">
-            <p style="font-size: 12px; color: #78716c; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 12px;">Whats Moving</p>
-            {stories_html}
+        research_html = f"""
+        <div style="margin-bottom: 28px;">
+            <p style="font-size: 11px; color: #78716c; text-transform: uppercase; letter-spacing: 1.5px; margin-bottom: 12px; font-weight: 600;">📚 Research Radar</p>
+            {items_html}
         </div>
         """
-    
-    # Build Worth a Click section
-    worth_a_click_html = ""
+
+    # Build Builder's Bench section
+    tools_html = ""
+    if brief.builder_corner:
+        items_html = ""
+        for item in brief.builder_corner[:5]:
+            items_html += f"""
+            <div style="margin-bottom: 12px;">
+                <a href="{item.url}" style="color: #2563eb; text-decoration: none; font-weight: 500;">{item.title}</a>
+                <span style="color: #78716c; font-size: 13px;"> ({item.source_name})</span>
+                <p style="margin: 4px 0 0 0; font-size: 14px; color: #57534e;">{item.insight_summary or ''}</p>
+            </div>
+            """
+        tools_html = f"""
+        <div style="margin-bottom: 28px;">
+            <p style="font-size: 11px; color: #78716c; text-transform: uppercase; letter-spacing: 1.5px; margin-bottom: 12px; font-weight: 600;">🛠️ Builder's Bench</p>
+            {items_html}
+        </div>
+        """
+
+    # Build Industry Watch section
+    industry_html = ""
+    if brief.top_signal:
+        items_html = ""
+        for item in brief.top_signal[:5]:
+            items_html += f"""
+            <div style="margin-bottom: 12px;">
+                <a href="{item.url}" style="color: #2563eb; text-decoration: none; font-weight: 500;">{item.title}</a>
+                <span style="color: #78716c; font-size: 13px;"> ({item.source_name})</span>
+            </div>
+            """
+        industry_html = f"""
+        <div style="margin-bottom: 28px;">
+            <p style="font-size: 11px; color: #78716c; text-transform: uppercase; letter-spacing: 1.5px; margin-bottom: 12px; font-weight: 600;">📰 Industry Watch</p>
+            {items_html}
+        </div>
+        """
+
+    # Build Quick Links section
+    links_html = ""
     if brief.worth_a_click:
-        links_html = ""
-        for item in brief.worth_a_click:
-            links_html += f"""
-            <li style="margin-bottom: 8px;">
+        items_html = ""
+        for item in brief.worth_a_click[:8]:
+            items_html += f"""
+            <li style="margin-bottom: 6px;">
                 <a href="{item.url}" style="color: #2563eb; text-decoration: none;">{item.title}</a>
-                <span style="color: #78716c;"> ({item.source_name})</span>
+                <span style="color: #a8a29e; font-size: 12px;"> ({item.source_name})</span>
             </li>
             """
-        worth_a_click_html = f"""
-        <div style="margin-bottom: 32px;">
-            <p style="font-size: 12px; color: #78716c; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 12px;">Worth a Click</p>
-            <ul style="padding-left: 20px; margin: 0;">{links_html}</ul>
+        links_html = f"""
+        <div style="margin-bottom: 28px;">
+            <p style="font-size: 11px; color: #78716c; text-transform: uppercase; letter-spacing: 1.5px; margin-bottom: 12px; font-weight: 600;">🔗 Quick Links</p>
+            <ul style="padding-left: 18px; margin: 0; font-size: 14px;">{items_html}</ul>
         </div>
         """
-    
-    # Build Claudes Take section
-    claudes_take_html = ""
-    if brief.claudes_take:
-        take_text = brief.claudes_take.replace("\n", "<br>")
-        claudes_take_html = f"""
-        <div style="margin-bottom: 32px;">
-            <p style="font-size: 12px; color: #78716c; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 12px;">Claudes Take</p>
-            <p style="color: #44403c; font-style: italic;">{take_text}</p>
-        </div>
-        """
-    
-    # Quick catchup text
-    catchup_text = brief.quick_catchup.replace("\n", "<br>")
-    
-    # Full HTML email
+
+    # Full HTML email - new format
     html_body = f"""
 <!DOCTYPE html>
 <html>
 <head>
     <style>
-        body {{ font-family: Georgia, serif; line-height: 1.6; color: #1c1917; max-width: 600px; margin: 0 auto; padding: 20px; }}
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; color: #1c1917; max-width: 640px; margin: 0 auto; padding: 24px; }}
+        a {{ color: #2563eb; }}
     </style>
 </head>
 <body>
-    <p style="font-size: 12px; color: #78716c; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px;">Intelligence Brief - {brief.date}</p>
-    
-    <div style="margin-bottom: 32px;">
-        <p style="font-size: 12px; color: #78716c; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 12px;">The Quick Catch-Up</p>
-        <p style="font-size: 18px; color: #1c1917; line-height: 1.5;">{catchup_text}</p>
+    <p style="font-size: 11px; color: #a8a29e; text-transform: uppercase; letter-spacing: 1.5px; margin-bottom: 4px;">Intelligence Brief</p>
+    <p style="font-size: 13px; color: #78716c; margin-bottom: 24px;">{brief.date}</p>
+
+    <!-- THE BRIEF - Doris's Narrative -->
+    <div style="margin-bottom: 40px; font-size: 16px; line-height: 1.7;">
+        {narrative_html}
     </div>
-    
-    {whats_moving_html}
-    
-    {worth_a_click_html}
-    
-    {claudes_take_html}
-    
-    <p style="font-size: 12px; color: #a8a29e; margin-top: 32px; padding-top: 16px; border-top: 1px solid #e7e5e4;">
+
+    <!-- DEEPER DIVES -->
+    <div style="border-top: 1px solid #e7e5e4; padding-top: 24px;">
+        <p style="font-size: 11px; color: #a8a29e; text-transform: uppercase; letter-spacing: 1.5px; margin-bottom: 20px;">Deeper Dives</p>
+
+        {research_html}
+        {tools_html}
+        {industry_html}
+        {links_html}
+    </div>
+
+    <p style="font-size: 11px; color: #a8a29e; margin-top: 32px; padding-top: 16px; border-top: 1px solid #e7e5e4;">
         Scanned {brief.total_items_scanned} items from {len(brief.sources_checked)} sources
     </p>
 </body>

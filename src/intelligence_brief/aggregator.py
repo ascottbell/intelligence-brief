@@ -53,11 +53,21 @@ class Aggregator:
         # GitHub Trending
         self.sources.append(GitHubTrendingSource(since="daily"))
         
-        # Reddit
-        if self.settings.reddit_list:
+        # Reddit (configured + discovered)
+        from .source_discovery import get_discovered_reddit_subs
+
+        reddit_subs = list(self.settings.reddit_list) if self.settings.reddit_list else []
+
+        # Add discovered subreddits
+        discovered_subs = get_discovered_reddit_subs()
+        for sub in discovered_subs:
+            if sub not in reddit_subs:
+                reddit_subs.append(sub)
+
+        if reddit_subs:
             self.sources.append(
                 RedditSource(
-                    subreddits=self.settings.reddit_list,
+                    subreddits=reddit_subs,
                     max_items=15
                 )
             )
@@ -67,6 +77,15 @@ class Aggregator:
             self.sources.append(
                 RSSSource(
                     feeds=self.settings.company_blog_list,
+                    max_items=10
+                )
+            )
+
+        # Mainstream news sources (RSS)
+        if self.settings.news_source_list:
+            self.sources.append(
+                RSSSource(
+                    feeds=self.settings.news_source_list,
                     max_items=10
                 )
             )
@@ -164,77 +183,152 @@ class Aggregator:
 
 
 class BriefGenerator:
-    """Generates the daily intelligence brief - newsletter style."""
-    
+    """Generates the daily intelligence brief - narrative + sections style."""
+
     def __init__(self):
         self.settings = get_settings()
         self.analyzer = ContentAnalyzer()
-    
+
     async def generate_brief(
-        self, 
+        self,
         items: list[ContentItem],
         sources_checked: list[str]
     ) -> DailyBrief:
         """Generate the daily brief from analyzed items."""
-        
-        # Sort by relevance
+
+        # Sort by relevance (newsworthiness)
         sorted_items = sorted(
-            items, 
-            key=lambda x: x.relevance_score or 0, 
+            items,
+            key=lambda x: x.relevance_score or 0,
             reverse=True
         )
-        
-        # Filter to relevant items only
-        relevant_items = [i for i in sorted_items if (i.relevance_score or 0) >= 0.5]
-        
-        # Generate quick catchup
+
+        # Lower threshold - we want more content now (0.35 instead of 0.5)
+        relevant_items = [i for i in sorted_items if (i.relevance_score or 0) >= 0.35]
+
+        # Generate THE BRIEF - Doris's narrative with inline links
+        print("Generating Doris's narrative brief...")
+        narrative_brief = await self.analyzer.generate_narrative_brief(relevant_items)
+
+        # Generate quick catchup (short teaser for email preview)
         print("Generating quick catchup...")
-        quick_catchup = await self.analyzer.generate_quick_catchup(relevant_items)
-        
-        # Build "What's Moving" stories (top 5-7 items with rich context)
-        print("Generating story contexts...")
+        quick_catchup = await self.analyzer.generate_quick_catchup(relevant_items[:8])
+
+        # Categorize items for DEEPER DIVES sections
+        sections = self._categorize_for_sections(relevant_items)
+
+        # Build "What's Moving" from top items for backwards compat
+        whats_moving_items = self._select_diverse_items(relevant_items, target_count=7)
         whats_moving = []
-        for item in relevant_items[:7]:
-            context = await self.analyzer.generate_story_context(item)
+        for item in whats_moving_items:
             story = StoryItem(
                 headline=item.title,
-                context=context,
+                context=item.insight_summary or item.summary or "",
                 source_url=item.url,
                 source_name=item.source_name,
                 source_item=item
             )
             whats_moving.append(story)
-            await asyncio.sleep(0.3)  # Rate limit
-        
-        # "Worth a Click" - next tier of items
-        worth_a_click = relevant_items[7:15]
-        
-        # Generate Claude's take
-        print("Generating Claude's take...")
-        claudes_take = await self.analyzer.generate_synthesis(relevant_items)
-        
-        # Build legacy categories for backwards compat
-        categories = self._categorize_items(items)
-        
+
+        # "Worth a Click" - everything not in the main narrative
+        used_ids = {item.id for item in whats_moving_items}
+        remaining = [i for i in relevant_items if i.id not in used_ids]
+        worth_a_click = remaining[:15]  # More items now
+
         brief = DailyBrief(
             date=datetime.utcnow().strftime("%Y-%m-%d"),
             quick_catchup=quick_catchup,
             whats_moving=whats_moving,
             worth_a_click=worth_a_click,
-            claudes_take=claudes_take,
-            # Legacy fields
-            top_signal=categories["top_signal"],
-            builder_corner=categories["builder_corner"],
-            paper_of_the_day=categories["paper_of_day"][0] if categories["paper_of_day"] else None,
-            homelab_corner=categories["homelab"],
-            honorable_mentions=categories["honorable_mentions"],
-            synthesis=claudes_take,
+            claudes_take=narrative_brief,  # This is now the main narrative
+            # Sections for deeper dives
+            top_signal=sections["industry_news"],
+            builder_corner=sections["tools"],
+            paper_of_the_day=sections["research"][0] if sections["research"] else None,
+            homelab_corner=sections["research"][1:4] if len(sections["research"]) > 1 else [],
+            honorable_mentions=sections["other"],
+            synthesis=narrative_brief,
             total_items_scanned=len(items),
             sources_checked=sources_checked,
         )
-        
+
         return brief
-    
+
+    def _categorize_for_sections(self, items: list[ContentItem]) -> dict[str, list[ContentItem]]:
+        """Categorize items into DEEPER DIVES sections based on source and category."""
+        sections = {
+            "industry_news": [],  # Mainstream news, company blogs
+            "research": [],       # arXiv papers
+            "tools": [],          # GitHub, dev tools
+            "other": [],          # Everything else
+        }
+
+        # Source types that map to sections
+        industry_sources = {'nyt', 'wapo', 'verge', 'ars_technica', 'techcrunch', 'wired', 'mit_tech_review', 'company_blog'}
+        research_sources = {'arxiv'}
+        tool_sources = {'github'}
+
+        for item in items:
+            source = item.source_type.value
+
+            # Check category tag from analysis
+            category = None
+            for idea in (item.actionable_ideas or []):
+                if idea.startswith('category:'):
+                    category = idea.replace('category:', '')
+                    break
+
+            if source in research_sources or category == 'research':
+                if len(sections["research"]) < 5:
+                    sections["research"].append(item)
+            elif source in tool_sources or category == 'tools':
+                if len(sections["tools"]) < 6:
+                    sections["tools"].append(item)
+            elif source in industry_sources or category == 'industry_news':
+                if len(sections["industry_news"]) < 6:
+                    sections["industry_news"].append(item)
+            else:
+                if len(sections["other"]) < 8:
+                    sections["other"].append(item)
+
+        return sections
+
+    def _select_diverse_items(self, items: list[ContentItem], target_count: int) -> list[ContentItem]:
+        """
+        Select items ensuring source type diversity.
+        Takes the best item from each source type first, then fills with top remaining.
+        """
+        if not items:
+            return []
+
+        # Group by source type
+        by_source: dict[str, list[ContentItem]] = {}
+        for item in items:
+            source_key = item.source_type.value
+            if source_key not in by_source:
+                by_source[source_key] = []
+            by_source[source_key].append(item)
+
+        selected = []
+        used_ids = set()
+
+        # First pass: take best item from each source type
+        for source_key in by_source:
+            if by_source[source_key] and len(selected) < target_count:
+                best = by_source[source_key][0]  # Already sorted by relevance
+                selected.append(best)
+                used_ids.add(best.id)
+
+        # Second pass: fill remaining slots with highest relevance items
+        for item in items:
+            if len(selected) >= target_count:
+                break
+            if item.id not in used_ids:
+                selected.append(item)
+                used_ids.add(item.id)
+
+        return selected
+
     def _categorize_items(self, items: list[ContentItem]) -> dict[str, list[ContentItem]]:
         """Categorize items into brief sections (legacy)."""
         categories = {
@@ -285,44 +379,68 @@ class BriefGenerator:
     def format_brief_text(self, brief: DailyBrief) -> str:
         """Format brief as readable text."""
         lines = []
-        
+
         lines.append(f"🧠 Intelligence Brief - {brief.date}")
         lines.append("=" * 50)
         lines.append("")
-        
-        # Quick Catchup
-        lines.append("THE QUICK CATCH-UP")
+
+        # THE BRIEF - Doris's narrative (main content)
+        lines.append("THE BRIEF")
         lines.append("-" * 30)
-        lines.append(brief.quick_catchup)
+        lines.append(brief.claudes_take or brief.quick_catchup)
         lines.append("")
-        
-        # What's Moving
-        if brief.whats_moving:
-            lines.append("WHAT'S MOVING")
+
+        # DEEPER DIVES
+        lines.append("DEEPER DIVES")
+        lines.append("=" * 50)
+        lines.append("")
+
+        # Research Radar (papers)
+        if brief.paper_of_the_day or brief.homelab_corner:
+            lines.append("📚 RESEARCH RADAR")
             lines.append("-" * 30)
-            for story in brief.whats_moving:
-                lines.append(f"▸ {story.headline}")
-                lines.append(f"  {story.context}")
-                lines.append(f"  → {story.source_url}")
+            if brief.paper_of_the_day:
+                lines.append(f"▸ {brief.paper_of_the_day.title}")
+                lines.append(f"  {brief.paper_of_the_day.insight_summary or ''}")
+                lines.append(f"  → {brief.paper_of_the_day.url}")
                 lines.append("")
-        
-        # Worth a Click
-        if brief.worth_a_click:
-            lines.append("WORTH A CLICK")
+            for item in (brief.homelab_corner or []):
+                lines.append(f"• {item.title}")
+                lines.append(f"  → {item.url}")
+            lines.append("")
+
+        # Builder's Bench (tools/repos)
+        if brief.builder_corner:
+            lines.append("🛠️ BUILDER'S BENCH")
             lines.append("-" * 30)
-            for item in brief.worth_a_click:
+            for item in brief.builder_corner:
+                lines.append(f"▸ {item.title} ({item.source_name})")
+                if item.insight_summary:
+                    lines.append(f"  {item.insight_summary}")
+                lines.append(f"  → {item.url}")
+                lines.append("")
+
+        # Industry Watch (news)
+        if brief.top_signal:
+            lines.append("📰 INDUSTRY WATCH")
+            lines.append("-" * 30)
+            for item in brief.top_signal:
+                lines.append(f"▸ {item.title} ({item.source_name})")
+                if item.insight_summary:
+                    lines.append(f"  {item.insight_summary}")
+                lines.append(f"  → {item.url}")
+                lines.append("")
+
+        # Quick Links (everything else)
+        if brief.worth_a_click:
+            lines.append("🔗 QUICK LINKS")
+            lines.append("-" * 30)
+            for item in brief.worth_a_click[:10]:
                 lines.append(f"• {item.title} ({item.source_name})")
                 lines.append(f"  {item.url}")
             lines.append("")
-        
-        # Claude's Take
-        if brief.claudes_take:
-            lines.append("CLAUDE'S TAKE")
-            lines.append("-" * 30)
-            lines.append(brief.claudes_take)
-            lines.append("")
-        
+
         lines.append("-" * 50)
         lines.append(f"Scanned {brief.total_items_scanned} items from {len(brief.sources_checked)} sources")
-        
+
         return "\n".join(lines)

@@ -4,4 +4,4 @@ builder = "NIXPACKS"
 [deploy]
 startCommand = "cd src && python -m intelligence_brief.main run"
 restartPolicyType = "NEVER"
-cronSchedule = "43 13 * * *"
+cronSchedule = "27 11 * * 1,3,5"

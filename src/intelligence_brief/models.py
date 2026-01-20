@@ -30,9 +30,16 @@ class SourceType(str, Enum):
     TWITTER = "twitter"
     MEDIUM = "medium"
     HUGGINGFACE = "huggingface"
-    NYT = "nyt"
     RSS = "rss"
     PODCAST = "podcast"
+    # Mainstream news
+    NYT = "nyt"
+    WAPO = "wapo"
+    VERGE = "verge"
+    ARS_TECHNICA = "ars_technica"
+    TECHCRUNCH = "techcrunch"
+    WIRED = "wired"
+    MIT_TECH_REVIEW = "mit_tech_review"
 
 
 class ContentItem(BaseModel):

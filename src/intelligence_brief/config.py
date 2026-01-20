@@ -61,6 +61,29 @@ class Settings(BaseSettings):
         description="Comma-separated RSS feed URLs"
     )
 
+    # Mainstream news sources (AI/tech coverage)
+    news_sources: str = Field(
+        # NYT Technology
+        "https://rss.nytimes.com/services/xml/rss/nyt/Technology.xml,"
+        # Washington Post Technology
+        "https://feeds.washingtonpost.com/rss/business/technology,"
+        # The Verge AI
+        "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml,"
+        # Ars Technica AI
+        "https://arstechnica.com/ai/feed/,"
+        # TechCrunch AI
+        "https://techcrunch.com/category/artificial-intelligence/feed/,"
+        # Wired AI
+        "https://www.wired.com/feed/tag/ai/latest/rss,"
+        # MIT Technology Review AI
+        "https://www.technologyreview.com/topic/artificial-intelligence/feed/",
+        description="Mainstream news RSS feeds for AI/tech coverage"
+    )
+
+    @property
+    def news_source_list(self) -> list[str]:
+        return [s.strip() for s in self.news_sources.split(",") if s.strip()]
+
     # Podcasts (transcribed via Groq)
     groq_api_key: Optional[str] = Field(None, description="Groq API key for podcast transcription")
     podcast_feeds: str = Field(

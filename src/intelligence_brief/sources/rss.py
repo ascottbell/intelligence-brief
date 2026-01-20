@@ -42,7 +42,8 @@ class RSSSource(BaseSource):
     def _get_source_type(self, url: str) -> SourceType:
         """Determine source type from URL."""
         domain = urlparse(url).netloc.lower()
-        
+
+        # Company blogs
         if 'anthropic' in domain:
             return SourceType.COMPANY_BLOG
         if 'openai' in domain:
@@ -53,9 +54,23 @@ class RSSSource(BaseSource):
             return SourceType.HUGGINGFACE
         if 'medium' in domain:
             return SourceType.MEDIUM
+
+        # Mainstream news
         if 'nytimes' in domain:
             return SourceType.NYT
-        
+        if 'washingtonpost' in domain:
+            return SourceType.WAPO
+        if 'theverge' in domain:
+            return SourceType.VERGE
+        if 'arstechnica' in domain:
+            return SourceType.ARS_TECHNICA
+        if 'techcrunch' in domain:
+            return SourceType.TECHCRUNCH
+        if 'wired' in domain:
+            return SourceType.WIRED
+        if 'technologyreview' in domain:
+            return SourceType.MIT_TECH_REVIEW
+
         return SourceType.RSS
     
     def _parse_date(self, entry: dict) -> Optional[datetime]:
