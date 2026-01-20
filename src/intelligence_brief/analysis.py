@@ -170,14 +170,14 @@ CRITICAL: Respond with ONLY the raw JSON object below. Do NOT wrap it in markdow
             keyword_matches = sum(1 for kw in ai_keywords if kw in text)
             score += min(keyword_matches * 10, 60)
 
-            # 2. SOURCE AUTHORITY (0-50 points)
-            # Mainstream news gets high priority
+            # 2. SOURCE AUTHORITY (0-55 points)
+            # Mainstream news gets highest priority (we want NYT/etc to appear)
             mainstream_news = ['nyt', 'wapo', 'verge', 'ars_technica', 'techcrunch', 'wired', 'mit_tech_review']
             if item.source_type.value in mainstream_news:
-                score += 40
+                score += 55
             # Company blogs (official announcements)
             elif item.source_type.value == 'company_blog':
-                score += 50
+                score += 45
             # Research
             elif item.source_type.value == 'arxiv':
                 score += 35

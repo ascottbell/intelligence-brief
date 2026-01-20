@@ -162,18 +162,25 @@ class Aggregator:
     
     async def aggregate_and_analyze(self) -> tuple[list[ContentItem], list[str]]:
         """Fetch, filter, and analyze all content."""
+        from .brief_storage import get_recently_shown_urls
+
         all_items = await self.fetch_all()
         sources_checked = [s.source_name for s in self.sources]
-        
+
         recent_items = self._filter_by_time(all_items)
         print(f"Filtered to {len(recent_items)} recent items")
-        
+
         unique_items = self._deduplicate(recent_items)
         print(f"Deduplicated to {len(unique_items)} items")
-        
-        analyzed_items = await self.analyzer.batch_analyze(unique_items)
+
+        # Filter out items shown in recent briefs (cross-brief deduplication)
+        recently_shown = get_recently_shown_urls(days=14)
+        fresh_items = [i for i in unique_items if str(i.url) not in recently_shown]
+        print(f"After removing recently shown: {len(fresh_items)} items ({len(unique_items) - len(fresh_items)} excluded)")
+
+        analyzed_items = await self.analyzer.batch_analyze(fresh_items)
         print(f"Analyzed {len(analyzed_items)} items")
-        
+
         return analyzed_items, sources_checked
     
     async def close(self):
@@ -195,6 +202,8 @@ class BriefGenerator:
         sources_checked: list[str]
     ) -> DailyBrief:
         """Generate the daily brief from analyzed items."""
+        import re
+        from .brief_storage import mark_items_shown
 
         # Sort by relevance (newsworthiness)
         sorted_items = sorted(
@@ -210,12 +219,17 @@ class BriefGenerator:
         print("Generating Doris's narrative brief...")
         narrative_brief = await self.analyzer.generate_narrative_brief(relevant_items)
 
+        # Extract URLs mentioned in the narrative to exclude from Deeper Dives
+        narrative_urls = set(re.findall(r'\[([^\]]+)\]\(([^)]+)\)', narrative_brief))
+        narrative_url_set = {url for _, url in narrative_urls}
+        print(f"Found {len(narrative_url_set)} URLs in narrative to exclude from sections")
+
         # Generate quick catchup (short teaser for email preview)
         print("Generating quick catchup...")
         quick_catchup = await self.analyzer.generate_quick_catchup(relevant_items[:8])
 
-        # Categorize items for DEEPER DIVES sections
-        sections = self._categorize_for_sections(relevant_items)
+        # Categorize items for DEEPER DIVES sections (excluding narrative items)
+        sections = self._categorize_for_sections(relevant_items, exclude_urls=narrative_url_set)
 
         # Build "What's Moving" from top items for backwards compat
         whats_moving_items = self._select_diverse_items(relevant_items, target_count=7)
@@ -252,10 +266,20 @@ class BriefGenerator:
             sources_checked=sources_checked,
         )
 
+        # Mark all items shown in this brief for cross-brief deduplication
+        all_shown_items = list(worth_a_click)
+        all_shown_items.extend(sections["industry_news"])
+        all_shown_items.extend(sections["tools"])
+        all_shown_items.extend(sections["research"])
+        all_shown_items.extend(sections["other"])
+        all_shown_items.extend([s.source_item for s in whats_moving if s.source_item])
+        mark_items_shown(all_shown_items)
+        print(f"Marked {len(all_shown_items)} items as shown for future deduplication")
+
         return brief
 
-    def _categorize_for_sections(self, items: list[ContentItem]) -> dict[str, list[ContentItem]]:
-        """Categorize items into DEEPER DIVES sections based on source and category."""
+    def _categorize_for_sections(self, items: list[ContentItem], exclude_urls: set = None) -> dict[str, list[ContentItem]]:
+        """Categorize items into DEEPER DIVES sections with source diversity."""
         sections = {
             "industry_news": [],  # Mainstream news, company blogs
             "research": [],       # arXiv papers
@@ -263,13 +287,29 @@ class BriefGenerator:
             "other": [],          # Everything else
         }
 
+        # Track source counts per section (max 2 per source per section)
+        section_source_counts = {
+            "industry_news": {},
+            "research": {},
+            "tools": {},
+            "other": {},
+        }
+        MAX_PER_SOURCE = 2
+
         # Source types that map to sections
         industry_sources = {'nyt', 'wapo', 'verge', 'ars_technica', 'techcrunch', 'wired', 'mit_tech_review', 'company_blog'}
         research_sources = {'arxiv'}
         tool_sources = {'github'}
 
+        exclude_urls = exclude_urls or set()
+
         for item in items:
+            # Skip items already used in narrative
+            if str(item.url) in exclude_urls:
+                continue
+
             source = item.source_type.value
+            source_name = item.source_name
 
             # Check category tag from analysis
             category = None
@@ -278,18 +318,26 @@ class BriefGenerator:
                     category = idea.replace('category:', '')
                     break
 
+            # Determine target section
             if source in research_sources or category == 'research':
-                if len(sections["research"]) < 5:
-                    sections["research"].append(item)
+                target = "research"
+                max_items = 5
             elif source in tool_sources or category == 'tools':
-                if len(sections["tools"]) < 6:
-                    sections["tools"].append(item)
+                target = "tools"
+                max_items = 6
             elif source in industry_sources or category == 'industry_news':
-                if len(sections["industry_news"]) < 6:
-                    sections["industry_news"].append(item)
+                target = "industry_news"
+                max_items = 6
             else:
-                if len(sections["other"]) < 8:
-                    sections["other"].append(item)
+                target = "other"
+                max_items = 8
+
+            # Check section limits and source diversity
+            if len(sections[target]) < max_items:
+                source_count = section_source_counts[target].get(source_name, 0)
+                if source_count < MAX_PER_SOURCE:
+                    sections[target].append(item)
+                    section_source_counts[target][source_name] = source_count + 1
 
         return sections
 

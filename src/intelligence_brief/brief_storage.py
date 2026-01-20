@@ -37,9 +37,26 @@ def init_db():
         )
     """)
 
+    # Track shown items for cross-brief deduplication
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS shown_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_url TEXT NOT NULL,
+            item_title TEXT,
+            shown_date TEXT NOT NULL,
+            source_name TEXT
+        )
+    """)
+
     # Index for date lookups and search
     cursor.execute("""
         CREATE INDEX IF NOT EXISTS idx_briefs_date ON briefs(date)
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_shown_items_url ON shown_items(item_url)
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_shown_items_date ON shown_items(shown_date)
     """)
 
     conn.commit()
@@ -205,10 +222,59 @@ def cleanup_old_briefs(retention_days: int = 14):
 
     cutoff = (datetime.utcnow() - timedelta(days=retention_days)).strftime("%Y-%m-%d")
     cursor.execute("DELETE FROM briefs WHERE date < ?", (cutoff,))
-    deleted = cursor.rowcount
+    deleted_briefs = cursor.rowcount
+
+    # Also clean up old shown_items
+    cursor.execute("DELETE FROM shown_items WHERE shown_date < ?", (cutoff,))
+    deleted_items = cursor.rowcount
 
     conn.commit()
     conn.close()
 
-    if deleted > 0:
-        print(f"Cleaned up {deleted} briefs older than {retention_days} days")
+    if deleted_briefs > 0 or deleted_items > 0:
+        print(f"Cleaned up {deleted_briefs} briefs and {deleted_items} shown items older than {retention_days} days")
+
+
+def mark_items_shown(items: list, date: str = None):
+    """Mark items as shown to prevent them from appearing in future briefs."""
+    init_db()
+    db_path = get_db_path()
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    if date is None:
+        date = datetime.utcnow().strftime("%Y-%m-%d")
+
+    for item in items:
+        url = str(item.get("url", "")) if isinstance(item, dict) else str(item.url)
+        title = item.get("title", "") if isinstance(item, dict) else item.title
+        source = item.get("source_name", "") if isinstance(item, dict) else getattr(item, "source_name", "")
+
+        cursor.execute("""
+            INSERT OR IGNORE INTO shown_items (item_url, item_title, shown_date, source_name)
+            VALUES (?, ?, ?, ?)
+        """, (url, title, date, source))
+
+    conn.commit()
+    conn.close()
+
+
+def get_recently_shown_urls(days: int = 14) -> set:
+    """Get URLs of items shown in recent briefs."""
+    init_db()
+    db_path = get_db_path()
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    cutoff = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+    cursor.execute("SELECT item_url FROM shown_items WHERE shown_date >= ?", (cutoff,))
+    urls = {row[0] for row in cursor.fetchall()}
+
+    conn.close()
+    return urls
+
+
+def is_item_recently_shown(url: str, days: int = 14) -> bool:
+    """Check if an item URL was shown in recent briefs."""
+    shown_urls = get_recently_shown_urls(days)
+    return str(url) in shown_urls
